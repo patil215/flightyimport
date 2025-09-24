@@ -9,6 +9,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import traceback
 
 import click
 from openai import OpenAI
@@ -202,16 +203,23 @@ def filter_by_date(rows: List[FlightRow], start_date: Optional[date], end_date: 
     return kept
 
 
-def dedupe(rows: List[FlightRow]) -> List[FlightRow]:
-    seen: set[str] = set()
-    unique: List[FlightRow] = []
-    for r in rows:
-        key = f"{r.flight_number.upper()}|{r.date_iso}" if r.flight_number else f"|{r.date_iso}"
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(r)
-    return unique
+def _merge_rows(existing: FlightRow, new: FlightRow) -> None:
+    if not existing.origin_iata and new.origin_iata:
+        existing.origin_iata = new.origin_iata
+    if not existing.destination_iata and new.destination_iata:
+        existing.destination_iata = new.destination_iata
+    if not existing.flight_number and new.flight_number:
+        existing.flight_number = new.flight_number
+    if not existing.airline and new.airline:
+        existing.airline = new.airline
+    if not existing.seat and new.seat:
+        existing.seat = new.seat
+    if not existing.cabin and new.cabin:
+        existing.cabin = new.cabin
+    if not existing.confirmation_code and new.confirmation_code:
+        existing.confirmation_code = new.confirmation_code
+    if not existing.notes and new.notes:
+        existing.notes = new.notes
 
 
 def write_csv(rows: List[FlightRow], path: str) -> None:
@@ -226,12 +234,9 @@ def write_csv(rows: List[FlightRow], path: str) -> None:
         "ConfirmationCode",
         "Notes",
     ]
-    file_exists = os.path.exists(path)
-    file_empty = os.path.getsize(path) == 0 if file_exists else True
-    with open(path, "a", newline="", encoding="utf-8") as f:
+    with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=headers)
-        if not file_exists or file_empty:
-            writer.writeheader()
+        writer.writeheader()
         for r in rows:
             writer.writerow(
                 {
@@ -248,6 +253,20 @@ def write_csv(rows: List[FlightRow], path: str) -> None:
             )
 
 
+overwrite_csv = write_csv
+
+
+def _row_key(r: FlightRow) -> str:
+    return f"{(r.flight_number or '').upper()}|{r.date_iso}"
+
+
+def _first_non_empty(series: Iterable[Optional[str]]) -> str:
+    for v in series:
+        if v is None:
+            continue
+        if isinstance(v, str) and v.strip():
+            return v
+    return ""
 def _parse_date(value: str) -> date:
     return datetime.strptime(value, "%Y-%m-%d").date()
 
@@ -274,51 +293,63 @@ def main(start_date: str, end_date: str, output: str, user_name: str) -> None:
         click.echo(f"[simple] Found {len(ids)} messages", err=False)
 
         output_path = os.path.abspath(output)
-        seen: set[str] = set()
-        # Preload seen with any existing CSV entries to avoid re-adding duplicates across runs
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            try:
-                with open(output_path, "r", encoding="utf-8") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        date_iso = (row.get("Date") or "").strip()
-                        flight_no = (row.get("Flight") or "").strip().upper()
-                        key = f"{flight_no}|{date_iso}" if flight_no else f"|{date_iso}"
-                        if date_iso:
-                            seen.add(key)
-            except Exception:
-                pass
-        total_written = 0
-        lock = threading.Lock()
+
+        thread_local = threading.local()
+
+        def _thread_service() -> Any:
+            svc = getattr(thread_local, "svc", None)
+            if svc is None:
+                # Build a separate Gmail client per thread
+                svc = build_gmail_service()
+                thread_local.svc = svc
+            return svc
 
         def worker(mid: str) -> List[FlightRow]:
-            msg = get_message(service, mid)
+            svc = _thread_service()
+            msg = get_message(svc, mid)
             text, html = extract_bodies(msg)
-            extracted = ai_extract_rows(text, html, user_name.strip())
-            extracted = filter_by_date(extracted, start, end)
-            result: List[FlightRow] = []
-            with lock:
-                for r in extracted:
-                    key = f"{r.flight_number.upper()}|{r.date_iso}" if r.flight_number else f"|{r.date_iso}"
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    result.append(r)
-            return result
+            rows = ai_extract_rows(text, html, user_name.strip())
+            return filter_by_date(rows, start, end)
 
-        with ThreadPoolExecutor(max_workers=10) as ex:
-            futures = []
-            for idx, msg_id in enumerate(ids, start=1):
-                click.echo(f"[simple] Processing {idx}/{len(ids)}...", err=False)
-                futures.append(ex.submit(worker, msg_id))
+        processed = 0
+        all_rows: List[FlightRow] = []
+        with ThreadPoolExecutor(max_workers=30) as ex:
+            futures = [ex.submit(worker, mid) for mid in ids]
             for fut in as_completed(futures):
-                batch = fut.result()
-                if batch:
-                    with lock:
-                        write_csv(batch, output_path)
-                        total_written += len(batch)
+                try:
+                    batch = fut.result()
+                except Exception as e:
+                    processed += 1
+                    click.echo(f"[simple] Error processing {processed}/{len(ids)}: {e}", err=True)
+                    click.echo(traceback.format_exc(), err=True)
+                    continue
+                processed += 1
+                click.echo(f"[simple] successfully processed {processed}/{len(ids)}", err=False)
+                for r in batch:
+                    click.echo(
+                        f"[row] {r.date_iso} {r.origin_iata}->{r.destination_iata} "
+                        f"{r.flight_number} {r.airline} seat={r.seat} cabin={r.cabin} "
+                        f"conf={r.confirmation_code}",
+                        err=False,
+                    )
+                all_rows.extend(batch)
 
-        click.echo(f"Wrote {total_written} flights to: {output_path}")
+        # Merge rows by key (Flight|Date), filling missing fields
+        merged: Dict[str, FlightRow] = {}
+        merges_count = 0
+        for r in all_rows:
+            key = _row_key(r)
+            if key in merged:
+                before = merged[key].__dict__.copy()
+                _merge_rows(merged[key], r)
+                if merged[key].__dict__ != before:
+                    merges_count += 1
+            else:
+                merged[key] = r
+
+        final_rows = sorted(merged.values(), key=lambda r: (r.date_iso, r.flight_number))
+        overwrite_csv(final_rows, output_path)
+        click.echo(f"[simple] Merged {merges_count} rows; wrote {len(final_rows)} total to: {output_path}")
     except FileNotFoundError as e:
         click.echo(str(e), err=True)
         sys.exit(1)
